@@ -1,110 +1,165 @@
-#!/usr/bin/env python
-
-# Copyright (c) Robert Blair Mason Jr. (rbmj) rbmj@verizon.net
-# see LICENSE for license information.
 
 import socket
+import struct
 import sys
 import threading
-import atexit
 import time
-
-#allow import in both python 2.x and 3.x
-try:
-    from Queue import Queue, Empty
-except ImportError:
-    from queue import Queue, Empty
-
-_is_py2 = (sys.version_info[0] == 2)
 
 def _output_fn(s):
     sys.stdout.write(s.encode(sys.stdout.encoding, errors='replace').decode(sys.stdout.encoding))
 
-def _input_fn(q):
-    def enqueue_output_file(f, q):
-        for line in iter(f.readline, b''): #thanks to stackoverflow
-            q.put((True, line))
-    
-    stdin_reader = threading.Thread(target = enqueue_output_file, args = (sys.stdin, q))
-    stdin_reader.daemon = True
-    stdin_reader.start()
+class StreamEOF(IOError):
+    pass
 
-
-def run(UDP_IN_PORT=6666, UDP_OUT_PORT=6668, init_event=None, bcast_address='255.255.255.255',
-        output_fn=_output_fn, input_fn=_input_fn):
+class Netconsole:
     '''
+        Implements the 2018+ netconsole protocol
+    '''
+    
+    def __init__(self, address):
+        
+        self.frames = {
+            11: self._onError,
+            12: self._onInfo
+        }
+        
+        self.cond = threading.Condition()
+        self.sock = None
+        
+    
+    def start(self):
+        with self.cond:
+            self.running = True
+            
+            self._rt = threading.Thread(target=self._readThread,
+                                        name='nc-read-thread',
+                                        daemon=True)
+            self._rt.start()
+            
+            self._kt = threading.Thread(target=self._keepAlive,
+                                        name='nc-keepalive-thread',
+                                        daemon=True)
+            self._kt.start()
+    
+    def stop(self):
+        with self.cond:
+            self.running = False
+            self.cond.notifyAll()
+            self.sock.close()
+    
+    def _readStruct(self, s):
+        sz = s.size
+        data = self.sockrfp.read(sz)
+        if len(data) != sz:
+            raise StreamEOF("connection dropped")
+        return s.unpack(data)
+    
+    def _keepAlive(self):
+        self.reconnect()
+        while self.running:
+            time.sleep(2000)
+            try:
+                self.sockwfp.write(b'\x00\x00')
+                self.sockwfp.flush()
+            except IOError:
+                self.reconnect()
+    
+    def _readThread(self):
+        while self.running:
+            if not self._keepAliveThread.isAlive():
+                break
+            if self.connected:
+                blen, tag = self._readStruct(self._header)
+                blen -= 1
+                
+                buf = self.sockrfp.read(blen)
+                if len(buf) != blen:
+                    raise StreamEOF("connection dropped")
+                
+                # process the frame
+                fn = self.frames.get(tag)
+                if fn:
+                    fn(buf)
+                else:
+                    print("ERROR: Unknown tag %s; Ignoring..." % tag)
+                
+    def _reconnect(self):
+        self.connected = False
+        while self.running:
+            # close the old socket
+            
+            
+            self.sock = socket.socket()
+            self.sock.connect()#target, 1741, 3 second timeout
+            # set tcp no delay
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.sockrfp = self.sock.makefile('rb')
+            self.sockwfp = self.sock.makefile('wb')
+            
+            print("connected")
+            self.connected = True
+            break
+        
+    _header = struct.Struct('>Hb')
+    _errorFrame = struct.Struct('>dHH')
+    _infoFrame = struct.Struct('>dH')
+    
+    _short = struct.Struct('>H')
+    
+    
+    def _onError(self, b):
+        ts, _seq, _numOcc, errCode, flags = self._errorFrame.unpack(b[:])
+        # get float - timestamp
+        # get short - seq
+        # get short - numOcc
+        # get int - errorCode
+        # get byte - flags
+        # get details (str)
+        # get location (str)
+        # get callStack (str)
+        pass
+    
+        "[${timestamp.round(2)}] ${type(flags)} ${errorCode} ${details} ${location} ${callStack}"
+    
+    def getStr(self, b, idx):
+        blen = 
+        # get short (size)
+        # decode buffer
+        pass
+    
+        return s, blen
+    
+    def _onInfo(self, b):
+        ts, _seq = self._infoFrame.unpack(b[:2])
+        # get float -ts
+        self._in
+        # get short - seq
+        # decode utf-8
+        s = b[2:].decode('utf-8', errors='replace')
+        
+        print()
+        
+    
+
+def run(address, init_event=None):
+    '''
+        Starts the netconsole loop
+    
+        :param address: Address of the netconsole server
         :param init_event: a threading.event object, upon which the 'set'
                            function will be called when the connection has
                            succeeded.
-                           
-        :param output_fn:  This function gets called with a string each time
-                           a line is received from the netconsole port
-        :param input_fn:   This function is called once, with a python queue
-                           object that input can be pushed into. Input must
-                           be pushed as a tuple, with the first argument
-                           as 'True' and the second argument as bytes or str
     '''
-
-    #set up receiving socket
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind( ('',UDP_IN_PORT) )
-
-    #set up sending socket - use separate socket to avoid race condition
-    out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    out.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    out.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    out.bind( ('',UDP_OUT_PORT) ) #bind is necessary for escoteric reasons stated on interwebs
-
-    #set up atexit handler to close sockets
-    def atexit_func():
-        sock.close()
-        out.close()
-
-    atexit.register(atexit_func)
-
-    #set up threads to emulate non-blocking io
-    #thread-level emulation required for compatibility with windows
-    queue = Queue()
-
-    def enqueue_output_sock(s, q):
-        if init_event is not None:
-            init_event.set()
-        
-        while True:
-            q.put((False, s.recv(4096)))
-
-    sock_reader = threading.Thread(target = enqueue_output_sock, args = (sock, queue))
-    sock_reader.daemon = True
-    sock_reader.start()
     
-    input_fn(queue)
-    
-    if _is_py2:
-        def send_msg(msg):
-            out.sendto(msg, (bcast_address, UDP_OUT_PORT))
-    else:
-        def send_msg(msg):
-            out.sendto(msg.encode('utf-8'), (bcast_address, UDP_OUT_PORT))
-    
-    #main loop
-    while True:
-        
-        is_input, msg = queue.get()
-        
-        if is_input:
-            if bcast_address is None:
-                sys.stderr.write("Error: Output not supported by netconsole without specifying a broadcast address\n")
-            else:
-                send_msg(msg)
-        else:
-            output_fn(msg.decode('utf-8', errors='replace'))
+    # do something about fakeds here? maybe a boolean parameter
 
 
 def main():
     bcast_address = None
     if len(sys.argv) > 1:
         bcast_address = sys.argv[1]
+    
+    
 
     run(bcast_address=bcast_address)
 
