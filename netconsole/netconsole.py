@@ -16,7 +16,7 @@ class Netconsole:
         Implements the 2018+ netconsole protocol
     '''
     
-    def __init__(self, address):
+    def __init__(self):
         
         self.frames = {
             11: self._onError,
@@ -25,10 +25,15 @@ class Netconsole:
         
         self.cond = threading.Condition()
         self.sock = None
+        self.sockaddr = None
         
     
-    def start(self):
+    def start(self, address, port=1741):
+        if self.running:
+            raise ValueError("Cannot start without stopping first")
+        
         with self.cond:
+            self.sockaddr = (address, port)
             self.running = True
             
             self._rt = threading.Thread(target=self._readThread,
@@ -47,12 +52,10 @@ class Netconsole:
             self.cond.notifyAll()
             self.sock.close()
     
-    def _readStruct(self, s):
-        sz = s.size
-        data = self.sockrfp.read(sz)
-        if len(data) != sz:
-            raise StreamEOF("connection dropped")
-        return s.unpack(data)
+    def _keepAliveReady(self):
+        if not self.running:
+            return -1
+        
     
     def _keepAlive(self):
         self.reconnect()
@@ -64,15 +67,29 @@ class Netconsole:
             except IOError:
                 self.reconnect()
     
+    def _readThreadReady(self):
+        if not self.running:
+            return -1
+        return self.sockrfp
+    
     def _readThread(self):
-        while self.running:
-            if not self._keepAliveThread.isAlive():
-                break
-            if self.connected:
+        while True:
+            with self.cond:
+                sockrfp = self.cond.wait_for(self._readThreadReady)
+                if sockrfp == -1:
+                    return
+                
+                # readStruct
+                sz = s.size
+                data = self.sockrfp.read(sz)
+                if len(data) != sz:
+                    raise StreamEOF("connection dropped")
+                return s.unpack(data)
+            
                 blen, tag = self._readStruct(self._header)
                 blen -= 1
                 
-                buf = self.sockrfp.read(blen)
+                buf = sockrfp.read(blen)
                 if len(buf) != blen:
                     raise StreamEOF("connection dropped")
                 
@@ -84,8 +101,13 @@ class Netconsole:
                     print("ERROR: Unknown tag %s; Ignoring..." % tag)
                 
     def _reconnect(self):
+        # returns once the socket is connected
+        
         self.connected = False
+        if self.sock:
+        
         while self.running:
+            
             # close the old socket
             
             
@@ -98,48 +120,39 @@ class Netconsole:
             
             print("connected")
             self.connected = True
+            # notifyAll()
             break
         
     _header = struct.Struct('>Hb')
+    
     _errorFrame = struct.Struct('>dHH')
+    _errorFrameSz = _errorFrame.size
+    
     _infoFrame = struct.Struct('>dH')
+    _infoFrameSz = _infoFrame.size
     
     _short = struct.Struct('>H')
-    
+    _shortSz = _short.size
     
     def _onError(self, b):
-        ts, _seq, _numOcc, errCode, flags = self._errorFrame.unpack(b[:])
-        # get float - timestamp
-        # get short - seq
-        # get short - numOcc
-        # get int - errorCode
-        # get byte - flags
-        # get details (str)
-        # get location (str)
-        # get callStack (str)
-        pass
+        ts, _seq, _numOcc, errorCode, flags = self._errorFrame.unpack(b[:self._errorFrameSz])
+        details, nidx = self._getStr(b, self._errorFrameSz)
+        location, nidx = self._getStr(b, nidx)
+        callStack, _ = self._getStr(b, nidx)
+        
+        print('[%0.2f]' % ts, errorCode, details, location, callStack)
     
-        "[${timestamp.round(2)}] ${type(flags)} ${errorCode} ${details} ${location} ${callStack}"
-    
-    def getStr(self, b, idx):
-        blen = 
-        # get short (size)
-        # decode buffer
-        pass
-    
-        return s, blen
+    def _getStr(self, b, idx):
+        sidx = idx + self._shortSz
+        blen = self._short.unpack(b[idx:sidx])
+        nextidx = sidx + blen
+        return b[sidx:nextidx].decode('utf-8', errors='replace'), nextidx
     
     def _onInfo(self, b):
-        ts, _seq = self._infoFrame.unpack(b[:2])
-        # get float -ts
-        self._in
-        # get short - seq
-        # decode utf-8
-        s = b[2:].decode('utf-8', errors='replace')
-        
-        print()
-        
-    
+        ts, _seq = self._infoFrame.unpack(b[:self._infoFrameSz])
+        msg = b[self._infoFrameSz:].decode('utf-8', errors='replace')
+        print('[%0.2f]' % ts, msg)
+
 
 def run(address, init_event=None):
     '''
